@@ -316,11 +316,14 @@ def fipc_zerocopy_inplace_rtt(lengths, iters=30, warmup=5):
 
         cli = fastipc.Client.create(prefix, 0, POOLS)
 
+        # Pre-compute a reusable arange for in-place copy via copyto
+        _arange_src = np.arange(max(lengths), dtype=np.int64)
+
         for i in range(warmup):
             ti = cli.alloc_array(L, np.dtype("int64"))
             sm = cli.alloc_array(L, np.dtype("int64"))
             ti.fill(42)
-            np.arange(L, dtype=np.int64, out=sm)
+            np.copyto(sm, _arange_src[:L])
             cli.push_put_zerocopy(ti, sm)
             r = cli.pull(timeout_ms=5000)
             assert r is not None
@@ -332,7 +335,7 @@ def fipc_zerocopy_inplace_rtt(lengths, iters=30, warmup=5):
             sm = cli.alloc_array(L, np.dtype("int64"))
             # "In-place" fill — data generated directly in shm, no external source
             ti.fill(i)
-            np.arange(L, dtype=np.int64, out=sm)
+            np.copyto(sm, _arange_src[:L])
             tid = cli.push_put_zerocopy(ti, sm)
             r = cli.pull(timeout_ms=5000)
             rtts.append((time.perf_counter() - t0) * 1e6)
