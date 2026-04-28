@@ -383,9 +383,13 @@ def _fipc_client_fn(cid, prefix, reqs_per_client, token_len, use_zerocopy, rq):
     rq.put((cid, acked, dt))
 
 
+_conc_counter = 0
+
 def fipc_concurrent_qps(num_clients, reqs_per_client, token_len, use_zerocopy=False):
+    global _conc_counter
+    _conc_counter += 1
     tag = "zc" if use_zerocopy else "mc"
-    prefix = f"bench_{tag}_conc"
+    prefix = f"b{tag}{_conc_counter}"
     total = num_clients * reqs_per_client
     ready = mp.Event(); done = mp.Event()
     srv = mp.Process(target=fipc_server_proc,
