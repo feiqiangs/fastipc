@@ -137,6 +137,28 @@ def zmq_rtt_single(lengths, iters=30, warmup=5):
     return results
 
 
+def _zmq_client_fn(cid, ep, reqs_per_client, token_len, barrier, rq):
+    ctx = zmq.Context(1)
+    send = _zmq_socket(ctx, zmq.PUSH, ep, bind=False)
+    cli_ep = _new_ipc()
+    recv = _zmq_socket(ctx, zmq.PULL, cli_ep, bind=True)
+    send.send_pyobj(RegisterRequest(cid, cli_ep))
+    rng = np.random.default_rng(cid)
+    reqs = [PutRequest(cid, rng.integers(0, 1<<20, size=token_len, dtype=np.int64),
+                       np.arange(token_len, dtype=np.int64), None, cid*10_000_000+i)
+            for i in range(reqs_per_client)]
+    barrier.wait()
+    t0 = time.perf_counter()
+    for r in reqs: send.send_pyobj(r)
+    acks = 0
+    while acks < reqs_per_client:
+        try: recv.recv_pyobj(); acks += 1
+        except: break
+    dt = time.perf_counter() - t0
+    rq.put((cid, acks, dt))
+    send.close(0); recv.close(0); ctx.term()
+
+
 def zmq_concurrent_qps(num_clients, reqs_per_client, token_len):
     """Scenario B for ZMQ: concurrent throughput."""
     ep = _new_ipc()
@@ -148,28 +170,9 @@ def zmq_concurrent_qps(num_clients, reqs_per_client, token_len):
     barrier = mp.Barrier(num_clients + 1)
     rq = mp.Queue()
 
-    def cli_fn(cid):
-        ctx = zmq.Context(1)
-        send = _zmq_socket(ctx, zmq.PUSH, ep, bind=False)
-        cli_ep = _new_ipc()
-        recv = _zmq_socket(ctx, zmq.PULL, cli_ep, bind=True)
-        send.send_pyobj(RegisterRequest(cid, cli_ep))
-        rng = np.random.default_rng(cid)
-        reqs = [PutRequest(cid, rng.integers(0, 1<<20, size=token_len, dtype=np.int64),
-                           np.arange(token_len, dtype=np.int64), None, cid*10_000_000+i)
-                for i in range(reqs_per_client)]
-        barrier.wait()
-        t0 = time.perf_counter()
-        for r in reqs: send.send_pyobj(r)
-        acks = 0
-        while acks < reqs_per_client:
-            try: recv.recv_pyobj(); acks += 1
-            except: break
-        dt = time.perf_counter() - t0
-        rq.put((cid, acks, dt))
-        send.close(0); recv.close(0); ctx.term()
-
-    procs = [mp.Process(target=cli_fn, args=(c,)) for c in range(num_clients)]
+    procs = [mp.Process(target=_zmq_client_fn,
+                        args=(c, ep, reqs_per_client, token_len, barrier, rq))
+             for c in range(num_clients)]
     for p in procs: p.start()
     time.sleep(0.3); barrier.wait()
     t0 = time.perf_counter()
@@ -354,6 +357,32 @@ def fipc_zerocopy_inplace_rtt(lengths, iters=30, warmup=5):
 # ---------------------------------------------------------------------------
 #  FastIPC concurrent QPS (memcpy / zerocopy)
 # ---------------------------------------------------------------------------
+def _fipc_client_fn(cid, prefix, reqs_per_client, token_len, use_zerocopy, rq):
+    cli = fastipc.Client.create(prefix, cid, POOLS)
+    rng = np.random.default_rng(cid)
+    pushed = acked = 0
+    INFLIGHT = 16
+    t0 = time.perf_counter()
+    while acked < reqs_per_client:
+        while pushed < reqs_per_client and (pushed - acked) < INFLIGHT:
+            if use_zerocopy:
+                ti = cli.alloc_array(token_len, np.dtype("int64"))
+                sm = cli.alloc_array(token_len, np.dtype("int64"))
+                ti[:] = rng.integers(0, 1<<20, size=token_len, dtype=np.int64)
+                sm[:] = np.arange(token_len, dtype=np.int64)
+                cli.push_put_zerocopy(ti, sm)
+            else:
+                ti = rng.integers(0, 1<<20, size=token_len, dtype=np.int64)
+                sm = np.arange(token_len, dtype=np.int64)
+                cli.push_put(ti, sm)
+            pushed += 1
+        r = cli.pull(timeout_ms=10000)
+        if r is None: break
+        acked += 1
+    dt = time.perf_counter() - t0
+    rq.put((cid, acked, dt))
+
+
 def fipc_concurrent_qps(num_clients, reqs_per_client, token_len, use_zerocopy=False):
     tag = "zc" if use_zerocopy else "mc"
     prefix = f"bench_{tag}_conc"
@@ -365,32 +394,9 @@ def fipc_concurrent_qps(num_clients, reqs_per_client, token_len, use_zerocopy=Fa
 
     rq = mp.Queue()
 
-    def cli_fn(cid):
-        cli = fastipc.Client.create(prefix, cid, POOLS)
-        rng = np.random.default_rng(cid)
-        pushed = acked = 0
-        INFLIGHT = 16
-        t0 = time.perf_counter()
-        while acked < reqs_per_client:
-            while pushed < reqs_per_client and (pushed - acked) < INFLIGHT:
-                if use_zerocopy:
-                    ti = cli.alloc_array(token_len, np.dtype("int64"))
-                    sm = cli.alloc_array(token_len, np.dtype("int64"))
-                    ti[:] = rng.integers(0, 1<<20, size=token_len, dtype=np.int64)
-                    sm[:] = np.arange(token_len, dtype=np.int64)
-                    cli.push_put_zerocopy(ti, sm)
-                else:
-                    ti = rng.integers(0, 1<<20, size=token_len, dtype=np.int64)
-                    sm = np.arange(token_len, dtype=np.int64)
-                    cli.push_put(ti, sm)
-                pushed += 1
-            r = cli.pull(timeout_ms=10000)
-            if r is None: break
-            acked += 1
-        dt = time.perf_counter() - t0
-        rq.put((cid, acked, dt))
-
-    procs = [mp.Process(target=cli_fn, args=(c,)) for c in range(num_clients)]
+    procs = [mp.Process(target=_fipc_client_fn,
+                        args=(c, prefix, reqs_per_client, token_len, use_zerocopy, rq))
+             for c in range(num_clients)]
     for p in procs: p.start()
     t0 = time.perf_counter()
     for p in procs: p.join(timeout=60)
