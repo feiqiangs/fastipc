@@ -513,37 +513,168 @@ def fipc_concurrent_qps(num_clients, reqs_per_client, token_len, use_zerocopy=Fa
 
 
 # ===========================================================================
-#  Direct mode (in-process function call, no IPC) — baseline for zero overhead
+#  End-to-end RTT: from List[int] (tokenizer output) through the full path
+#  All 4 methods include:  List[int] → np.array → transport → handler ack
 # ===========================================================================
-def direct_mode_rtt(lengths, iters=30, warmup=5):
-    """Simulate FlexKV direct mode: caller and handler in the same process.
-    No IPC at all — just function call overhead + data access.
-    Data preparation (rng.integers, arange) is OUTSIDE timing to be fair."""
+
+def e2e_direct_rtt(lengths, iters=30, warmup=5):
+    """Direct mode: List[int] → np.array → handler(ndarray) in same process."""
     results = []
     for L in lengths:
         rng = np.random.default_rng(42)
-        payload_kb = L * 8 * 2 / 1024
+        # Pre-generate List[int] data (simulating tokenizer output)
+        list_data = [rng.integers(0, 1<<20, size=L, dtype=np.int64).tolist() for _ in range(iters + warmup)]
+        list_sm   = list(range(L))
 
         def handler(token_ids, slot_mapping):
-            # Touch all data — same work as server would do
-            _ = token_ids.sum() + slot_mapping.sum()
+            _ = token_ids[0] + slot_mapping[0]
 
         for i in range(warmup):
-            ti = rng.integers(0, 1<<20, size=L, dtype=np.int64)
-            sm = np.arange(L, dtype=np.int64)
+            ti = np.array(list_data[i], dtype=np.int64)
+            sm = np.array(list_sm, dtype=np.int64)
             handler(ti, sm)
 
         rtts = []
         for i in range(iters):
-            # Prepare data OUTSIDE timing
-            ti = rng.integers(0, 1<<20, size=L, dtype=np.int64)
-            sm = np.arange(L, dtype=np.int64)
-            # Only time the handler call
             t0 = time.perf_counter()
+            ti = np.array(list_data[warmup + i], dtype=np.int64)
+            sm = np.array(list_sm, dtype=np.int64)
             handler(ti, sm)
             rtts.append((time.perf_counter() - t0) * 1e6)
 
-        results.append({"tokens": L, "payload_kb": payload_kb,
+        results.append({"tokens": L, "payload_kb": L*8*2/1024,
+                        "mean_us": statistics.mean(rtts),
+                        "p50_us": statistics.median(rtts),
+                        "p99_us": float(np.percentile(rtts, 99)),
+                        "min_us": min(rtts)})
+    return results
+
+
+def e2e_zmq_rtt(lengths, iters=30, warmup=5):
+    """ZMQ: List[int] → np.array → pickle → IPC → unpickle → ack."""
+    results = []
+    for L in lengths:
+        ep = _new_ipc(); cli_ep = _new_ipc()
+        total = iters + warmup
+        ready = mp.Event(); done = mp.Event()
+        srv = mp.Process(target=zmq_server_proc, args=(ep, total, ready, done))
+        srv.start(); ready.wait()
+
+        ctx = zmq.Context(1)
+        send = _zmq_socket(ctx, zmq.PUSH, ep, bind=False)
+        recv = _zmq_socket(ctx, zmq.PULL, cli_ep, bind=True)
+        send.send_pyobj(RegisterRequest(0, cli_ep))
+
+        rng = np.random.default_rng(42)
+        list_data = [rng.integers(0, 1<<20, size=L, dtype=np.int64).tolist() for _ in range(total)]
+        list_sm   = list(range(L))
+
+        for i in range(warmup):
+            ti = np.array(list_data[i], dtype=np.int64)
+            sm = np.array(list_sm, dtype=np.int64)
+            send.send_pyobj(PutRequest(0, ti, sm, None, i))
+            recv.recv_pyobj()
+
+        rtts = []
+        for i in range(iters):
+            t0 = time.perf_counter()
+            ti = np.array(list_data[warmup + i], dtype=np.int64)
+            sm = np.array(list_sm, dtype=np.int64)
+            send.send_pyobj(PutRequest(0, ti, sm, None, warmup + i))
+            recv.recv_pyobj()
+            rtts.append((time.perf_counter() - t0) * 1e6)
+
+        done.wait(timeout=10); srv.join(timeout=5)
+        send.close(0); recv.close(0); ctx.term()
+        results.append({"tokens": L, "payload_kb": L*8*2/1024,
+                        "mean_us": statistics.mean(rtts),
+                        "p50_us": statistics.median(rtts),
+                        "p99_us": float(np.percentile(rtts, 99)),
+                        "min_us": min(rtts)})
+    return results
+
+
+def e2e_fipc_memcpy_rtt(lengths, iters=30, warmup=5):
+    """FIPC memcpy: List[int] → np.array → memcpy to shm → IPC → ack."""
+    results = []
+    for L in lengths:
+        prefix = f"e2e_mc_{L}"
+        total = iters + warmup
+        ready = mp.Event(); done = mp.Event()
+        srv = mp.Process(target=fipc_server_proc,
+                         args=(prefix, 1, total, ready, done, False, -1))
+        srv.start(); ready.wait()
+
+        cli = fastipc.Client.create(prefix, 0, POOLS)
+        rng = np.random.default_rng(42)
+        list_data = [rng.integers(0, 1<<20, size=L, dtype=np.int64).tolist() for _ in range(total)]
+        list_sm   = list(range(L))
+
+        for i in range(warmup):
+            ti = np.array(list_data[i], dtype=np.int64)
+            sm = np.array(list_sm, dtype=np.int64)
+            cli.push_put(ti, sm)
+            cli.pull(timeout_ms=5000)
+
+        rtts = []
+        for i in range(iters):
+            t0 = time.perf_counter()
+            ti = np.array(list_data[warmup + i], dtype=np.int64)
+            sm = np.array(list_sm, dtype=np.int64)
+            cli.push_put(ti, sm)
+            r = cli.pull(timeout_ms=5000)
+            rtts.append((time.perf_counter() - t0) * 1e6)
+            assert r is not None
+
+        done.set(); srv.join(timeout=10)
+        results.append({"tokens": L, "payload_kb": L*8*2/1024,
+                        "mean_us": statistics.mean(rtts),
+                        "p50_us": statistics.median(rtts),
+                        "p99_us": float(np.percentile(rtts, 99)),
+                        "min_us": min(rtts)})
+    return results
+
+
+def e2e_fipc_bpzc_rtt(lengths, iters=30, warmup=5):
+    """FIPC bp+zc: List[int] → write directly into shm ndarray → IPC → ack.
+    No intermediate np.array allocation — data goes straight to shm."""
+    results = []
+    for L in lengths:
+        prefix = f"e2e_bpzc_{L}"
+        total = iters + warmup
+        ready = mp.Event(); done = mp.Event()
+        srv = mp.Process(target=fipc_server_proc,
+                         args=(prefix, 1, total, ready, done, False, -1))
+        srv.start(); ready.wait()
+
+        cli = fastipc.Client.create(prefix, 0, POOLS)
+        rng = np.random.default_rng(42)
+        list_data = [rng.integers(0, 1<<20, size=L, dtype=np.int64).tolist() for _ in range(total)]
+        list_sm   = list(range(L))
+
+        for i in range(warmup):
+            ti = cli.alloc_array(L, np.dtype("int64"))
+            sm = cli.alloc_array(L, np.dtype("int64"))
+            ti[:] = list_data[i]
+            sm[:] = list_sm
+            cli.push_put_zerocopy(ti, sm)
+            cli.pull(timeout_ms=5000)
+
+        rtts = []
+        for i in range(iters):
+            t0 = time.perf_counter()
+            ti = cli.alloc_array(L, np.dtype("int64"))
+            sm = cli.alloc_array(L, np.dtype("int64"))
+            # Write List[int] directly into shm buffer — no intermediate ndarray
+            ti[:] = list_data[warmup + i]
+            sm[:] = list_sm
+            cli.push_put_zerocopy(ti, sm)
+            r = cli.pull(timeout_ms=5000)
+            rtts.append((time.perf_counter() - t0) * 1e6)
+            assert r is not None
+
+        done.set(); srv.join(timeout=10)
+        results.append({"tokens": L, "payload_kb": L*8*2/1024,
                         "mean_us": statistics.mean(rtts),
                         "p50_us": statistics.median(rtts),
                         "p99_us": float(np.percentile(rtts, 99)),
@@ -563,42 +694,33 @@ def main():
     lengths = [1024, 4096, 16384, 65536, 262144, 524288]
     ITERS = 30; WARMUP = 5
 
-    # ===== Scenario A: Single-client RTT =====
+    # ===== Scenario A: End-to-end from List[int] =====
     print("=" * 80)
-    print("Scenario A — 单请求端到端 RTT 对比 (单 client)")
+    print("Scenario A — 端到端 RTT：从 List[int] 到 handler ack（含 np.array 转换）")
     print("=" * 80)
 
-    print("\n[1/5] Direct mode (in-process, no IPC) ...")
-    direct_res = direct_mode_rtt(lengths, ITERS, WARMUP)
+    print("\n[1/4] Direct (in-process) ...")
+    direct_res = e2e_direct_rtt(lengths, ITERS, WARMUP)
 
-    print("[2/5] ZMQ + pickle ...")
-    zmq_res = zmq_rtt_single(lengths, ITERS, WARMUP)
+    print("[2/4] ZMQ + pickle (cross-process) ...")
+    zmq_res = e2e_zmq_rtt(lengths, ITERS, WARMUP)
 
-    print("[3/5] FastIPC (memcpy) ...")
-    mc_res = fipc_memcpy_rtt(lengths, ITERS, WARMUP)
+    print("[3/4] FastIPC busy-poll + memcpy (cross-process) ...")
+    mc_res = e2e_fipc_memcpy_rtt(lengths, ITERS, WARMUP)
 
-    print("[4/5] FastIPC (zerocopy, with [:]=) ...")
-    zc_res = fipc_zerocopy_rtt(lengths, ITERS, WARMUP)
-
-    print("[5/6] FastIPC (zerocopy, in-place fill) ...")
-    zci_res = fipc_zerocopy_inplace_rtt(lengths, ITERS, WARMUP)
-
-    print("[6/7] FastIPC (busy-poll, memcpy) ...")
-    bp_res = fipc_busypoll_rtt(lengths, ITERS, WARMUP)
-
-    print("[7/7] FastIPC (busy-poll + zero-copy inplace) ...")
-    bpzc_res = fipc_busypoll_zc_rtt(lengths, ITERS, WARMUP)
+    print("[4/4] FastIPC busy-poll + zero-copy (cross-process) ...")
+    bpzc_res = e2e_fipc_bpzc_rtt(lengths, ITERS, WARMUP)
 
     print()
-    hdr = f"{'tokens':>8} | {'payload':>10} | {'Direct':>10} | {'ZMQ+pkl':>10} | {'FIPC mc':>10} | {'FIPC zc':>10} | {'bp+mc':>10} | {'bp+zc':>10} | {'ZMQ/bp+zc':>9} | {'bp+zc/Dir':>9}"
+    hdr = f"{'tokens':>8} | {'payload':>10} | {'Direct':>12} | {'ZMQ+pickle':>12} | {'FIPC bp+mc':>12} | {'FIPC bp+zc':>12} | {'ZMQ/bp+zc':>9} | {'bp+zc/Dir':>9}"
     print(hdr)
     print("-" * len(hdr))
-    for d, z, m, zc, zci, bp, bpzc in zip(direct_res, zmq_res, mc_res, zc_res, zci_res, bp_res, bpzc_res):
-        L = z["tokens"]
-        zpk = f'{z["payload_kb"]:.0f} KB'
-        r_zbpzc = z["mean_us"] / bpzc["mean_us"] if bpzc["mean_us"] > 0 else 0
-        r_bpzcd = bpzc["mean_us"] / d["mean_us"] if d["mean_us"] > 0 else 0
-        print(f'{L:>8,} | {zpk:>10} | {d["mean_us"]:>8.1f}us | {z["mean_us"]:>8.1f}us | {m["mean_us"]:>8.1f}us | {zci["mean_us"]:>8.1f}us | {bp["mean_us"]:>8.1f}us | {bpzc["mean_us"]:>8.1f}us | {r_zbpzc:>8.1f}x | {r_bpzcd:>8.1f}x')
+    for d, z, m, bz in zip(direct_res, zmq_res, mc_res, bpzc_res):
+        L = d["tokens"]
+        zpk = f'{d["payload_kb"]:.0f} KB'
+        r_zbz = z["mean_us"] / bz["mean_us"] if bz["mean_us"] > 0 else 0
+        r_bzd = bz["mean_us"] / d["mean_us"] if d["mean_us"] > 0 else 0
+        print(f'{L:>8,} | {zpk:>10} | {d["mean_us"]:>10.1f}us | {z["mean_us"]:>10.1f}us | {m["mean_us"]:>10.1f}us | {bz["mean_us"]:>10.1f}us | {r_zbz:>8.1f}x | {r_bzd:>8.1f}x')
 
     # ===== Scenario B: Concurrent QPS =====
     combos = [
@@ -626,71 +748,29 @@ def main():
     # ===== Write markdown report =====
     report_path = os.path.join(_HERE, "zerocopy_vs_zmq_report.md")
     with open(report_path, "w", encoding="utf-8") as f:
-        f.write("# FastIPC Zero-Copy vs ZMQ+Pickle vs Direct Mode Benchmark Report\n\n")
+        f.write("# FastIPC vs ZMQ vs Direct: End-to-End from List[int] Benchmark\n\n")
         f.write(f"- Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"- Host: {_socket.gethostname()}, CPU: {mp.cpu_count()}, Python: {sys.version.split()[0]}\n")
         f.write(f"- numpy: {np.__version__}, pyzmq: {zmq.__version__}\n\n")
+        f.write("All methods start from `List[int]` (simulating tokenizer output) and include\n")
+        f.write("the `np.array()` conversion cost. This is the fairest end-to-end comparison.\n\n")
 
-        f.write("## Scenario A — Single Request RTT (us)\n\n")
-        f.write("| tokens | payload | Direct (no IPC) | ZMQ+pickle | FIPC memcpy | FIPC zc inplace | ZMQ/FIPC speedup | FIPC/Direct overhead |\n")
+        f.write("## Scenario A — End-to-End RTT (us)\n\n")
+        f.write("| tokens | payload | Direct | ZMQ+pickle | FIPC bp+mc | FIPC bp+zc | ZMQ/bp+zc | bp+zc/Direct |\n")
         f.write("|---:|---:|---:|---:|---:|---:|---:|---:|\n")
-        for d, z, m, zc, zci in zip(direct_res, zmq_res, mc_res, zc_res, zci_res):
-            L = z["tokens"]
-            pk = f'{z["payload_kb"]:.0f} KB'
-            r1 = z["mean_us"] / m["mean_us"] if m["mean_us"] > 0 else 0
-            r2 = m["mean_us"] / d["mean_us"] if d["mean_us"] > 0 else 0
-            f.write(f'| {L:,} | {pk} | {d["mean_us"]:.1f} | {z["mean_us"]:.1f} | {m["mean_us"]:.1f} | {zci["mean_us"]:.1f} | {r1:.1f}x | {r2:.1f}x |\n')
-
-        f.write("\n## Scenario B — Concurrent QPS (echo, auto_ack)\n\n")
-        f.write("| clients | reqs/c | tokens | ZMQ QPS | FIPC memcpy QPS | FIPC zerocopy QPS |\n")
-        f.write("|---:|---:|---:|---:|---:|---:|\n")
-        f.write("\n*(See stdout for detailed QPS numbers.)*\n")
+        for d, z, m, bz in zip(direct_res, zmq_res, mc_res, bpzc_res):
+            L = d["tokens"]
+            pk = f'{d["payload_kb"]:.0f} KB'
+            r1 = z["mean_us"] / bz["mean_us"] if bz["mean_us"] > 0 else 0
+            r2 = bz["mean_us"] / d["mean_us"] if d["mean_us"] > 0 else 0
+            f.write(f'| {L:,} | {pk} | {d["mean_us"]:.1f} | {z["mean_us"]:.1f} | {m["mean_us"]:.1f} | {bz["mean_us"]:.1f} | {r1:.1f}x | {r2:.1f}x |\n')
 
         f.write("\n## Key Observations\n\n")
-        f.write("### Direct Mode (no IPC, in-process function call)\n\n")
-        f.write("Direct mode represents the **theoretical minimum overhead** — it's equivalent to FlexKV's\n")
-        f.write("library mode where `KVManager` calls `KVTaskEngine` directly in the same process.\n")
-        f.write("The only cost is Python function call overhead + ndarray creation. **No data copy occurs**\n")
-        f.write("because the handler receives the same ndarray object by reference.\n\n")
-
-        if direct_res and zmq_res and mc_res and zci_res:
-            big_d   = next((r for r in direct_res if r["tokens"] == 524288), None)
-            big_zmq = next((r for r in zmq_res if r["tokens"] == 524288), None)
-            big_mc  = next((r for r in mc_res  if r["tokens"] == 524288), None)
-            big_zci = next((r for r in zci_res if r["tokens"] == 524288), None)
-            if big_d and big_zmq and big_mc and big_zci:
-                f.write(f"### 512K tokens (8 MB payload)\n\n")
-                f.write(f"| Method | RTT (us) | vs Direct |\n")
-                f.write(f"|:---|---:|---:|\n")
-                f.write(f"| Direct (no IPC) | {big_d['mean_us']:.0f} | 1.0x |\n")
-                f.write(f"| FastIPC memcpy | {big_mc['mean_us']:.0f} | {big_mc['mean_us']/big_d['mean_us']:.1f}x |\n")
-                f.write(f"| FastIPC zc inplace | {big_zci['mean_us']:.0f} | {big_zci['mean_us']/big_d['mean_us']:.1f}x |\n")
-                f.write(f"| ZMQ+pickle | {big_zmq['mean_us']:.0f} | {big_zmq['mean_us']/big_d['mean_us']:.1f}x |\n")
-                f.write(f"\n")
-
-            small_d   = next((r for r in direct_res if r["tokens"] == 1024), None)
-            small_zmq = next((r for r in zmq_res if r["tokens"] == 1024), None)
-            small_mc  = next((r for r in mc_res  if r["tokens"] == 1024), None)
-            small_zci = next((r for r in zci_res if r["tokens"] == 1024), None)
-            if small_d and small_zmq and small_mc and small_zci:
-                f.write(f"### 1K tokens (16 KB payload)\n\n")
-                f.write(f"| Method | RTT (us) | vs Direct |\n")
-                f.write(f"|:---|---:|---:|\n")
-                f.write(f"| Direct (no IPC) | {small_d['mean_us']:.1f} | 1.0x |\n")
-                f.write(f"| FastIPC memcpy | {small_mc['mean_us']:.1f} | {small_mc['mean_us']/small_d['mean_us']:.0f}x |\n")
-                f.write(f"| FastIPC zc inplace | {small_zci['mean_us']:.1f} | {small_zci['mean_us']/small_d['mean_us']:.0f}x |\n")
-                f.write(f"| ZMQ+pickle | {small_zmq['mean_us']:.1f} | {small_zmq['mean_us']/small_d['mean_us']:.0f}x |\n")
-
-        f.write("\n### Summary\n\n")
-        f.write("1. **Direct mode** (FlexKV library mode): Near-zero overhead. The ndarray is passed by reference,\n")
-        f.write("   no serialization, no IPC, no copy. This is the gold standard.\n")
-        f.write("2. **FastIPC memcpy**: 1 memcpy (ndarray → shm) + eventfd/FIFO signaling. For large payloads,\n")
-        f.write("   the memcpy dominates and RTT scales with payload size.\n")
-        f.write("3. **FastIPC zerocopy in-place**: Eliminates the memcpy by allocating ndarray directly in shm.\n")
-        f.write("   Approaches Direct mode performance for small payloads.\n")
-        f.write("4. **ZMQ+pickle**: pickle.dumps + 3 kernel memcpys + pickle.loads. Highest overhead at all sizes.\n")
-        f.write("5. **The IPC tax**: Even with zero-copy shm, cross-process signaling (epoll/FIFO) adds\n")
-        f.write("   ~50-60us of fixed overhead vs direct function call. This is the irreducible cost of IPC.\n")
+        f.write("All timings include `List[int] → np.array` conversion (same cost across all methods).\n\n")
+        f.write("- **Direct**: `np.array(list) → handler(ndarray)` — same process, zero IPC\n")
+        f.write("- **ZMQ+pickle**: `np.array(list) → pickle.dumps → UDS → pickle.loads → ack`\n")
+        f.write("- **FIPC bp+mc**: `np.array(list) → memcpy to shm → ring push → busy-poll pop → ack`\n")
+        f.write("- **FIPC bp+zc**: `alloc_array(shm) → list[:] into shm → ring push → busy-poll pop → ack`\n")
 
     print(f"\nReport written to: {report_path}")
 
