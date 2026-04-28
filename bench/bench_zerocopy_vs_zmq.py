@@ -425,15 +425,23 @@ def fipc_busypoll_zc_rtt(lengths, iters=30, warmup=5):
             assert r is not None
 
         rtts = []
+        # Collect breakdown for the largest size
+        t_alloc = t_fill = t_push = t_pull = 0.0
         for i in range(iters):
-            t0 = time.perf_counter()
+            ta = time.perf_counter()
             ti = cli.alloc_array(L, np.dtype("int64"))
             sm = cli.alloc_array(L, np.dtype("int64"))
+            tb = time.perf_counter()
             ti.fill(i)
             np.copyto(sm, _arange_src[:L])
+            tc = time.perf_counter()
             cli.push_put_zerocopy(ti, sm)
+            td = time.perf_counter()
             r = cli.pull(timeout_ms=5000)
-            rtts.append((time.perf_counter() - t0) * 1e6)
+            te = time.perf_counter()
+            rtts.append((te - ta) * 1e6)
+            t_alloc += (tb - ta); t_fill += (tc - tb)
+            t_push += (td - tc); t_pull += (te - td)
             assert r is not None
 
         done.set(); srv.join(timeout=10)
@@ -443,6 +451,11 @@ def fipc_busypoll_zc_rtt(lengths, iters=30, warmup=5):
                         "p50_us": statistics.median(rtts),
                         "p99_us": float(np.percentile(rtts, 99)),
                         "min_us": min(rtts)})
+        # Print breakdown
+        n = iters
+        print(f"    [{L:>7,}] alloc={t_alloc/n*1e6:.1f}us  fill={t_fill/n*1e6:.1f}us  "
+              f"push={t_push/n*1e6:.1f}us  pull(wait)={t_pull/n*1e6:.1f}us  "
+              f"total={statistics.mean(rtts):.1f}us")
     return results
 
 
