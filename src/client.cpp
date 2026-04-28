@@ -203,16 +203,28 @@ int64_t Client::push_put(
 
 bool Client::pull(PullResult& out, int timeout_ms) {
     auto* h = resp_ring_->header();
+    // Fast path: try pop immediately
     if (ring_try_pop(h, out.pod)) {
         char buf[64];
         while (::read(resp_fifo_read_fd_, buf, sizeof(buf)) > 0) {}
     } else {
-        epoll_event ev;
-        int n = ::epoll_wait(epoll_fd_, &ev, 1, timeout_ms);
-        if (n <= 0) return false;
-        char buf[64];
-        while (::read(resp_fifo_read_fd_, buf, sizeof(buf)) > 0) {}
-        if (!ring_try_pop(h, out.pod)) return false;
+        // Spin-first: busy-poll for a short while before falling back to epoll.
+        // This eliminates the epoll_wait + FIFO round-trip for low-latency responses.
+        for (int i = 0; i < 100000; ++i) {
+            if (ring_try_pop(h, out.pod)) goto got_it;
+#if defined(__x86_64__)
+            __builtin_ia32_pause();
+#endif
+        }
+        {
+            epoll_event ev;
+            int n = ::epoll_wait(epoll_fd_, &ev, 1, timeout_ms);
+            if (n <= 0) return false;
+            char buf[64];
+            while (::read(resp_fifo_read_fd_, buf, sizeof(buf)) > 0) {}
+            if (!ring_try_pop(h, out.pod)) return false;
+        }
+        got_it: ;
     }
 
     if (out.pod.mask.nbytes > 0 && out.pod.mask.pool_id < pools_.size()) {

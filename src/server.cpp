@@ -249,10 +249,13 @@ void Server::drain_ring(uint32_t client_id) {
 
 void Server::worker_main(int /*worker_id*/) {
     epoll_event events[64];
+    const bool pure_spin = (cfg_.spin_iters < 0);  // -1 = infinite spin (busy-poll)
     while (!stop_.load(std::memory_order_relaxed)) {
-        if (cfg_.spin_iters > 0) {
+        if (cfg_.spin_iters != 0) {
             int popped_any = 0;
-            for (int it = 0; it < cfg_.spin_iters; ++it) {
+            int max_iters = pure_spin ? (1 << 30) : cfg_.spin_iters;
+            for (int it = 0; it < max_iters; ++it) {
+                if (stop_.load(std::memory_order_relaxed)) return;
                 for (uint32_t c = 0; c < clients_.size(); ++c) {
                     auto* h = clients_[c]->req_ring->header();
                     if (ring_size(h) > 0) {
@@ -267,6 +270,7 @@ void Server::worker_main(int /*worker_id*/) {
 #endif
             }
             if (popped_any) continue;
+            if (pure_spin) continue;  // never fall through to epoll
         }
 
         int n = ::epoll_wait(epoll_fd_, events, 64, -1);

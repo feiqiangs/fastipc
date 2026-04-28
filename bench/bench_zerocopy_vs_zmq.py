@@ -190,11 +190,11 @@ import fastipc
 POOLS = [(512*1024, 1024), (4*1024*1024, 256), (16*1024*1024, 32)]
 
 
-def fipc_server_proc(prefix, max_clients, total, ready, done, auto_ack=True):
+def fipc_server_proc(prefix, max_clients, total, ready, done, auto_ack=True, spin_iters=0):
     srv = fastipc.Server.create(shm_prefix=prefix, max_clients=max_clients,
                                 num_workers=4, ring_capacity=1024,
                                 resp_capacity=1024, pools=POOLS,
-                                auto_ack=auto_ack)
+                                auto_ack=auto_ack, spin_iters=spin_iters)
     srv.start()
     ready.set()
     if auto_ack:
@@ -355,6 +355,50 @@ def fipc_zerocopy_inplace_rtt(lengths, iters=30, warmup=5):
 
 
 # ---------------------------------------------------------------------------
+#  FastIPC busy-poll mode: spin_iters=-1, server worker never sleeps
+# ---------------------------------------------------------------------------
+def fipc_busypoll_rtt(lengths, iters=30, warmup=5):
+    """FastIPC with busy-poll: server workers spin forever, no epoll/FIFO overhead."""
+    results = []
+    for L in lengths:
+        prefix = f"bench_bp_{L}"
+        total = iters + warmup
+        ready = mp.Event(); done = mp.Event()
+        srv = mp.Process(target=fipc_server_proc,
+                         args=(prefix, 1, total, ready, done, False, -1))
+        srv.start(); ready.wait()
+
+        cli = fastipc.Client.create(prefix, 0, POOLS)
+        rng = np.random.default_rng(42)
+
+        for i in range(warmup):
+            ti = rng.integers(0, 1<<20, size=L, dtype=np.int64)
+            sm = np.arange(L, dtype=np.int64)
+            cli.push_put(ti, sm)
+            r = cli.pull(timeout_ms=5000)
+            assert r is not None
+
+        rtts = []
+        for i in range(iters):
+            ti = rng.integers(0, 1<<20, size=L, dtype=np.int64)
+            sm = np.arange(L, dtype=np.int64)
+            t0 = time.perf_counter()
+            cli.push_put(ti, sm)
+            r = cli.pull(timeout_ms=5000)
+            rtts.append((time.perf_counter() - t0) * 1e6)
+            assert r is not None
+
+        done.set(); srv.join(timeout=10)
+        payload_kb = L * 8 * 2 / 1024
+        results.append({"tokens": L, "payload_kb": payload_kb,
+                        "mean_us": statistics.mean(rtts),
+                        "p50_us": statistics.median(rtts),
+                        "p99_us": float(np.percentile(rtts, 99)),
+                        "min_us": min(rtts)})
+    return results
+
+
+# ---------------------------------------------------------------------------
 #  FastIPC concurrent QPS (memcpy / zerocopy)
 # ---------------------------------------------------------------------------
 def _fipc_client_fn(cid, prefix, reqs_per_client, token_len, use_zerocopy, rq):
@@ -475,19 +519,22 @@ def main():
     print("[4/5] FastIPC (zerocopy, with [:]=) ...")
     zc_res = fipc_zerocopy_rtt(lengths, ITERS, WARMUP)
 
-    print("[5/5] FastIPC (zerocopy, in-place fill) ...")
+    print("[5/6] FastIPC (zerocopy, in-place fill) ...")
     zci_res = fipc_zerocopy_inplace_rtt(lengths, ITERS, WARMUP)
 
+    print("[6/6] FastIPC (busy-poll, memcpy) ...")
+    bp_res = fipc_busypoll_rtt(lengths, ITERS, WARMUP)
+
     print()
-    hdr = f"{'tokens':>8} | {'payload':>10} | {'Direct':>10} | {'ZMQ+pickle':>12} | {'FIPC memcpy':>12} | {'FIPC zc inpl':>13} | {'ZMQ/FIPC':>8} | {'FIPC/Dir':>8}"
+    hdr = f"{'tokens':>8} | {'payload':>10} | {'Direct':>10} | {'ZMQ+pickle':>12} | {'FIPC memcpy':>12} | {'FIPC busypoll':>14} | {'FIPC zc inpl':>13} | {'ZMQ/bp':>7} | {'bp/Dir':>7}"
     print(hdr)
     print("-" * len(hdr))
-    for d, z, m, zc, zci in zip(direct_res, zmq_res, mc_res, zc_res, zci_res):
+    for d, z, m, zc, zci, bp in zip(direct_res, zmq_res, mc_res, zc_res, zci_res, bp_res):
         L = z["tokens"]
         zpk = f'{z["payload_kb"]:.0f} KB'
-        ratio_zm = z["mean_us"] / m["mean_us"] if m["mean_us"] > 0 else 0
-        ratio_md = m["mean_us"] / d["mean_us"] if d["mean_us"] > 0 else 0
-        print(f'{L:>8,} | {zpk:>10} | {d["mean_us"]:>8.1f}us | {z["mean_us"]:>10.1f}us | {m["mean_us"]:>10.1f}us | {zci["mean_us"]:>11.1f}us | {ratio_zm:>7.1f}x | {ratio_md:>7.1f}x')
+        ratio_zbp = z["mean_us"] / bp["mean_us"] if bp["mean_us"] > 0 else 0
+        ratio_bpd = bp["mean_us"] / d["mean_us"] if d["mean_us"] > 0 else 0
+        print(f'{L:>8,} | {zpk:>10} | {d["mean_us"]:>8.1f}us | {z["mean_us"]:>10.1f}us | {m["mean_us"]:>10.1f}us | {bp["mean_us"]:>12.1f}us | {zci["mean_us"]:>11.1f}us | {ratio_zbp:>6.1f}x | {ratio_bpd:>6.1f}x')
 
     # ===== Scenario B: Concurrent QPS =====
     combos = [
