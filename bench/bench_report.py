@@ -377,7 +377,7 @@ def main():
         f.write("### 1. 实际使用场景（含 List[int] 转换）\n\n")
         f.write("在 sglang/vLLM + FlexKV 的实际调用链中，`List[int] → np.array()` 转换是端到端时延的**绝对主导项**（85-95%）。\n")
         f.write("在这个前提下：\n\n")
-        f.write("- **Direct 模式**（`dp_size=1`，单实例）仍是最优解，但优势从"百倍"缩小到 10-50%\n")
+        f.write("- **Direct 模式**（`dp_size=1`，单实例）仍是最优解，但优势从百倍级缩小到 10-50%\n")
         f.write("- **FIPC bp+zc** 比 ZMQ+pickle 快 1.2-2.7x，在必须跨进程时是最佳选择\n")
         f.write("- **优化重点**应放在减少 `List[int] → np.array` 的转换开销（如让 tokenizer 直接输出 ndarray）\n\n")
 
