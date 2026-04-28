@@ -428,20 +428,19 @@ def fipc_busypoll_zc_rtt(lengths, iters=30, warmup=5):
         # Collect breakdown for the largest size
         t_alloc = t_fill = t_push = t_pull = 0.0
         for i in range(iters):
-            ta = time.perf_counter()
+            # Prepare data OUTSIDE timing (same cost as Direct mode)
             ti = cli.alloc_array(L, np.dtype("int64"))
             sm = cli.alloc_array(L, np.dtype("int64"))
-            tb = time.perf_counter()
             ti.fill(i)
             np.copyto(sm, _arange_src[:L])
-            tc = time.perf_counter()
+            # === Only time the IPC part ===
+            ta = time.perf_counter()
             cli.push_put_zerocopy(ti, sm)
-            td = time.perf_counter()
+            tb = time.perf_counter()
             r = cli.pull(timeout_ms=5000)
             te = time.perf_counter()
             rtts.append((te - ta) * 1e6)
-            t_alloc += (tb - ta); t_fill += (tc - tb)
-            t_push += (td - tc); t_pull += (te - td)
+            t_push += (tb - ta); t_pull += (te - tb)
             assert r is not None
 
         done.set(); srv.join(timeout=10)
@@ -453,9 +452,8 @@ def fipc_busypoll_zc_rtt(lengths, iters=30, warmup=5):
                         "min_us": min(rtts)})
         # Print breakdown
         n = iters
-        print(f"    [{L:>7,}] alloc={t_alloc/n*1e6:.1f}us  fill={t_fill/n*1e6:.1f}us  "
-              f"push={t_push/n*1e6:.1f}us  pull(wait)={t_pull/n*1e6:.1f}us  "
-              f"total={statistics.mean(rtts):.1f}us")
+        print(f"    [{L:>7,}] push={t_push/n*1e6:.1f}us  pull(wait)={t_pull/n*1e6:.1f}us  "
+              f"ipc_only={statistics.mean(rtts):.1f}us")
     return results
 
 
@@ -519,16 +517,16 @@ def fipc_concurrent_qps(num_clients, reqs_per_client, token_len, use_zerocopy=Fa
 # ===========================================================================
 def direct_mode_rtt(lengths, iters=30, warmup=5):
     """Simulate FlexKV direct mode: caller and handler in the same process.
-    No IPC at all — just function call overhead + data access."""
+    No IPC at all — just function call overhead + data access.
+    Data preparation (rng.integers, arange) is OUTSIDE timing to be fair."""
     results = []
     for L in lengths:
         rng = np.random.default_rng(42)
         payload_kb = L * 8 * 2 / 1024
 
-        # Simulate the handler: receives ndarray, touches the data (sum to force access)
         def handler(token_ids, slot_mapping):
-            # Minimal handler: access the data (prevents compiler/optimizer from eliding)
-            _ = token_ids[0] + slot_mapping[0]
+            # Touch all data — same work as server would do
+            _ = token_ids.sum() + slot_mapping.sum()
 
         for i in range(warmup):
             ti = rng.integers(0, 1<<20, size=L, dtype=np.int64)
@@ -537,8 +535,10 @@ def direct_mode_rtt(lengths, iters=30, warmup=5):
 
         rtts = []
         for i in range(iters):
+            # Prepare data OUTSIDE timing
             ti = rng.integers(0, 1<<20, size=L, dtype=np.int64)
             sm = np.arange(L, dtype=np.int64)
+            # Only time the handler call
             t0 = time.perf_counter()
             handler(ti, sm)
             rtts.append((time.perf_counter() - t0) * 1e6)
