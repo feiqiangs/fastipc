@@ -1,0 +1,36 @@
+[sys] host=PHAEDONSUN-MC1 cpu=12 python=3.14.3 numpy=2.4.4 pyzmq=27.1.0
+
+========================================================================
+Scenario A  —  单请求端到端延迟 (iters=30, warmup=3)
+========================================================================
+  [L=  1,024] payload=    16.3 KB | mean=   117.2µs  p50=  115.4  p95=  136.3  p99=  153.9  bw=   135 MB/s
+  [L=  4,096] payload=    64.3 KB | mean=   225.2µs  p50=  217.4  p95=  305.1  p99=  323.0  bw=   279 MB/s
+  [L= 16,384] payload=   256.3 KB | mean=   570.1µs  p50=  551.9  p95=  712.3  p99=  781.6  bw=   439 MB/s
+  [L= 65,536] payload=  1024.3 KB | mean=  2098.8µs  p50= 2076.0  p95= 2364.5  p99= 2469.5  bw=   477 MB/s
+  [L=262,144] payload=  4096.3 KB | mean=  8434.8µs  p50= 8542.6  p95=10118.9  p99=10258.6  bw=   474 MB/s
+  [L=524,288] payload=  8192.3 KB | mean= 16712.5µs  p50=16594.6  p95=18295.1  p99=18627.1  bw=   479 MB/s
+
+========================================================================
+Scenario C  —  纯 pickle 序列化/反序列化 (无 IPC)
+========================================================================
+  [L=  1,024] payload=    16.3 KB | pickle.dumps=     6.2µs  pickle.loads=     4.0µs  total=    10.2µs
+  [L=  4,096] payload=    64.3 KB | pickle.dumps=    10.9µs  pickle.loads=     9.1µs  total=    20.0µs
+  [L= 16,384] payload=   256.3 KB | pickle.dumps=    72.3µs  pickle.loads=    11.2µs  total=    83.6µs
+  [L= 65,536] payload=  1024.3 KB | pickle.dumps=    74.5µs  pickle.loads=    21.4µs  total=    95.9µs
+  [L=262,144] payload=  4096.3 KB | pickle.dumps=   357.5µs  pickle.loads=   221.3µs  total=   578.8µs
+  [L=524,288] payload=  8192.3 KB | pickle.dumps=   797.0µs  pickle.loads=   625.1µs  total=  1422.0µs
+
+========================================================================
+Scenario B  —  并发客户端 vs 单线程 Server
+========================================================================
+  [clients= 1  reqs/c= 200  L= 1,024]  total=  200  wall=  0.15s  qps=   1349  bw=     21 MB/s  | srv: recv=  257.0ms  unpickle=    3.1ms
+  [clients= 4  reqs/c= 200  L= 1,024]  total=  800  wall=  0.16s  qps=   5033  bw=     80 MB/s  | srv: recv=  254.7ms  unpickle=    7.1ms
+  [clients= 8  reqs/c= 200  L= 1,024]  total= 1600  wall=  0.17s  qps=   9349  bw=    149 MB/s  | srv: recv=  256.8ms  unpickle=   11.4ms
+  [clients=16  reqs/c= 100  L= 1,024]  total= 1600  wall=  0.19s  qps=   8636  bw=    137 MB/s  | srv: recv=  231.2ms  unpickle=   11.6ms
+  [clients= 1  reqs/c= 100  L=16,384]  total=  100  wall=  0.18s  qps=    555  bw=    139 MB/s  | srv: recv=  294.0ms  unpickle=    2.8ms
+  [clients= 4  reqs/c= 100  L=16,384]  total=  400  wall=  0.22s  qps=   1828  bw=    458 MB/s  | srv: recv=  321.1ms  unpickle=    7.7ms
+  [clients= 8  reqs/c=  50  L=16,384]  total=  400  wall=  0.21s  qps=   1926  bw=    482 MB/s  | srv: recv=  266.4ms  unpickle=    8.7ms
+  [clients= 4  reqs/c=  20  L=262,144]  total=   80  wall=  0.43s  qps=    185  bw=    741 MB/s  | srv: recv=  489.6ms  unpickle=   49.2ms
+  [clients= 8  reqs/c=  10  L=524,288]  total=   80  wall=  0.68s  qps=    118  bw=    942 MB/s  | srv: recv=  702.9ms  unpickle=   71.6ms
+
+📄 报告已写入：/Users/sunfeiqiang/WorkBuddy/Claw/flexkv_zmq_benchmark_report.md
