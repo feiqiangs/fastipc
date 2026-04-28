@@ -382,7 +382,7 @@ def main():
         f.write("- **优化重点**应放在减少 `List[int] → np.array` 的转换开销（如让 tokenizer 直接输出 ndarray）\n\n")
 
         f.write("### 2. 纯通信开销\n\n")
-        f.write("如果不考虑上游 List[int] 转换ndarray开销，则：\n\n")
+        f.write("如果不考虑上游 List[int] 转换np.narray开销，则：\n\n")
         f.write("- **FIPC bp+zc 纯 IPC 开销仅 18-30µs**，是跨进程 shm+ring 方案的物理极限\n")
         f.write("- 比 ZMQ+pickle 快 **5-250x**（payload 越大优势越明显）\n")
         f.write("- 比 Direct 模式慢约 18-30µs（这是跨进程通信不可消除的固定开销：原子操作 + cache-line bouncing）\n")
